@@ -50,14 +50,14 @@ jobs:
       # ─────────────────────────────────────────────────────────────
       - name: Wiz directory scan (SCA)
         run: |
-          wizcli dir scan --path . -f sarif -o dir.sarif || true
+          wizcli dir scan --path . --format sarif --output-file dir.sarif || true
 
       # ─────────────────────────────────────────────────────────────
       # IaC Scan (Dockerfile misconfigurations)
       # ─────────────────────────────────────────────────────────────
       - name: Wiz IaC scan (Dockerfile)
         run: |
-          wizcli iac scan --path Dockerfile -f sarif -o dockerfile.sarif || true
+          wizcli iac scan --path Dockerfile --format sarif --output-file dockerfile.sarif || true
 
       # ─────────────────────────────────────────────────────────────
       # Build container image for scanning
@@ -77,8 +77,8 @@ jobs:
             --image wiz-vuln-demo:latest \
             --policy-hits-only \
             --policies "Zee-Container-Security" \
-            -f sarif \
-            -o image.sarif || true
+            --format sarif \
+            --output-file image.sarif || true
 
       - name: Wiz container image scan (per-layer JSON)
         run: |
@@ -86,8 +86,8 @@ jobs:
             --image wiz-vuln-demo:latest \
             --driver mountWithLayers \
             --policies "Zee-Container-Security" \
-            -f json \
-            -o image-layers.json || true
+            --format json \
+            --output-file image-layers.json || true
 
       - name: Fix file ownership
         run: |
