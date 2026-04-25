@@ -270,52 +270,72 @@ def _parse_msg_fields(text):
 
 def build_policy_attribution_map(json_path):
     """
-    Read image-layers.json and build a map of:
-      (cve_name, component_name, component_version) -> "failed" / "ignored" / None
-    
-    Returns the map plus stats for reporting.
+    Build a map of (cve, comp_name, comp_ver) -> attribution category.
+
+    V2 filter: classifies failed findings further by exploit + fix:
+      - "failed_actionable": failed + has exploit + has fix  (KEEP)
+      - "failed_no_exploit":  failed + has fix but no exploit (DROP)
+      - "failed_no_fix":     failed + has exploit but no fix  (DROP)
+      - "failed_neither":    failed + no exploit + no fix    (DROP)
+      - "ignored": in ignoredPolicyMatches (DROP)
+      - "below_threshold": neither failed nor ignored (DROP)
     """
     if not os.path.exists(json_path):
-        print(f"  ⚠️  {json_path} not found — cannot apply Wiz policy filter")
         return None, None
-    
     try:
         with open(json_path) as f:
             data = json.load(f)
     except Exception as e:
         print(f"  ⚠️  Could not parse {json_path}: {e}")
         return None, None
-    
-    result = data.get("result") or {}
+
     attribution = {}
-    stats = {"failed": 0, "ignored": 0, "below_threshold": 0, "total": 0}
-    
+    stats = {
+        "total": 0,
+        "failed_actionable": 0,    # failed + exploit + fix → KEEP
+        "failed_no_exploit": 0,    # failed + fix only      → DROP
+        "failed_no_fix": 0,        # failed + exploit only  → DROP
+        "failed_neither": 0,       # failed + neither       → DROP
+        "ignored": 0,
+        "below_threshold": 0,
+    }
+
+    result = data.get("result") or {}
     for source_key in ["osPackages", "libraries", "applications"]:
         for pkg in result.get(source_key, []) or []:
             pkg_name = (pkg.get("name") or "").strip().lower()
             pkg_ver = (pkg.get("version") or "").strip()
-            
             for vuln in pkg.get("vulnerabilities", []) or []:
                 cve = (vuln.get("name") or "").strip()
                 if not cve:
                     continue
-                
                 key = (cve, pkg_name, pkg_ver)
                 stats["total"] += 1
-                
-                failed = vuln.get("failedPolicyMatches")
-                ignored = vuln.get("ignoredPolicyMatches")
-                
-                if failed:
-                    attribution[key] = "failed"
-                    stats["failed"] += 1
-                elif ignored:
+
+                if vuln.get("failedPolicyMatches"):
+                    has_exploit = bool(vuln.get("hasExploit"))
+                    has_fix = vuln.get("fixedVersion") is not None and \
+                              str(vuln.get("fixedVersion")).strip() != ""
+
+                    if has_exploit and has_fix:
+                        attribution[key] = "failed_actionable"
+                        stats["failed_actionable"] += 1
+                    elif has_fix and not has_exploit:
+                        attribution[key] = "failed_no_exploit"
+                        stats["failed_no_exploit"] += 1
+                    elif has_exploit and not has_fix:
+                        attribution[key] = "failed_no_fix"
+                        stats["failed_no_fix"] += 1
+                    else:
+                        attribution[key] = "failed_neither"
+                        stats["failed_neither"] += 1
+                elif vuln.get("ignoredPolicyMatches"):
                     attribution[key] = "ignored"
                     stats["ignored"] += 1
                 else:
                     attribution[key] = "below_threshold"
                     stats["below_threshold"] += 1
-    
+
     return attribution, stats
 
 
@@ -645,26 +665,27 @@ def beautify_image_sarif(sarif, vuln_metadata_map, scan_report_url):
 
 def filter_sarif_by_wiz_policy(sarif, attribution_map, stats):
     """
-    Filter SARIF results based on Wiz policy attribution.
+    V2 FILTER: Keep only findings that pass ALL three criteria:
+      1. failedPolicyMatches non-empty (Wiz policy "Failed")
+      2. hasExploit == True (publicly exploitable)
+      3. fixedVersion != null (fix is available)
 
-    KEY INSIGHT: Wiz JSON output is binary — every finding is either:
-      - in failedPolicyMatches (= "Failed" in console = action required)
-      - in ignoredPolicyMatches (= "Below Threshold" or "Ignored" in console)
+    Findings classified as anything else are dropped:
+      - failed_no_exploit, failed_no_fix, failed_neither → DROP
+      - ignored, below_threshold                          → DROP
 
-    The console's "Ignored" vs "Below Threshold" distinction does NOT
-    appear in the JSON — both are lumped into ignoredPolicyMatches.
-
-    So we keep ONLY findings with non-empty failedPolicyMatches.
-    This matches the Wiz console's "Failed" count exactly.
-
-    Findings with ignoredPolicyMatches → DROPPED (they will not appear
-    in GitHub Security tab). They remain visible in the Wiz console.
+    Rationale: GitHub Security tab should surface only the highest-priority,
+    most-actionable findings. Findings without known exploits or without
+    available fixes remain visible in the Wiz console.
     """
     if not attribution_map:
         print(f"  ⚠️  No attribution map — skipping policy filter")
         return sarif
 
-    kept_failed = 0
+    kept = 0
+    dropped_no_exploit = 0
+    dropped_no_fix = 0
+    dropped_neither = 0
     dropped_ignored = 0
     dropped_below_threshold = 0
     unmatched = 0
@@ -675,8 +696,6 @@ def filter_sarif_by_wiz_policy(sarif, attribution_map, stats):
 
         for result in original_results:
             cve = (result.get("ruleId") or "").strip()
-
-            # Parse component+version from message.text
             msg_text = (result.get("message") or {}).get("text", "") or ""
             fields = parse_message_text(msg_text)
             comp_name = (fields.get("component") or "").strip().lower()
@@ -685,56 +704,73 @@ def filter_sarif_by_wiz_policy(sarif, attribution_map, stats):
             key = (cve, comp_name, comp_ver)
             attr = attribution_map.get(key)
 
-            if attr == "failed":
-                # Keep as Open alert — matches Wiz console "Failed"
+            if attr == "failed_actionable":
+                # KEEP: failed + has exploit + has fix (the actionable bucket)
                 new_results.append(result)
-                kept_failed += 1
+                kept += 1
+            elif attr == "failed_no_exploit":
+                dropped_no_exploit += 1
+            elif attr == "failed_no_fix":
+                dropped_no_fix += 1
+            elif attr == "failed_neither":
+                dropped_neither += 1
             elif attr == "ignored":
-                # Drop — Wiz JSON conflates "Ignored" and "Below Threshold"
-                # into this bucket; not actionable for GitHub Security tab
                 dropped_ignored += 1
             elif attr == "below_threshold":
-                # Drop — explicitly below policy threshold
                 dropped_below_threshold += 1
             else:
-                # Unmatched — SARIF result with no JSON counterpart.
-                # Conservative: drop it to keep noise low. Customer can
-                # always cross-reference Wiz console for full visibility.
+                # No JSON counterpart — drop conservatively
                 unmatched += 1
 
         run["results"] = new_results
 
-    total_dropped = dropped_ignored + dropped_below_threshold + unmatched
+    total_dropped = (dropped_no_exploit + dropped_no_fix + dropped_neither +
+                     dropped_ignored + dropped_below_threshold + unmatched)
+
+    failed_total = (stats["failed_actionable"] + stats["failed_no_exploit"] +
+                    stats["failed_no_fix"] + stats["failed_neither"])
 
     # Print attribution summary
-    print(f"\n  🎯 WIZ POLICY FILTER APPLIED")
-    print(f"     Wiz JSON had {stats['total']} total findings:")
-    print(f"       Failed:          {stats['failed']:>5}  → KEPT (Open in GitHub)")
-    print(f"       Ignored:         {stats['ignored']:>5}  → DROPPED")
-    print(f"       Below Threshold: {stats['below_threshold']:>5}  → DROPPED")
+    print(f"\n  🎯 WIZ V2 POLICY FILTER APPLIED")
+    print(f"     Wiz JSON: {stats['total']} total findings")
+    print(f"     ┌── Failed by Wiz policy:                         {failed_total:>5}")
+    print(f"     │   ✅ With exploit + fix (KEEP):                  {stats['failed_actionable']:>5}")
+    print(f"     │   ❌ With fix but no exploit (DROP):             {stats['failed_no_exploit']:>5}")
+    print(f"     │   ❌ With exploit but no fix (DROP):             {stats['failed_no_fix']:>5}")
+    print(f"     │   ❌ With neither exploit nor fix (DROP):        {stats['failed_neither']:>5}")
+    print(f"     ├── Ignored by Wiz policy (DROP):                 {stats['ignored']:>5}")
+    print(f"     └── Below threshold (DROP):                       {stats['below_threshold']:>5}")
+    print(f"")
     print(f"     SARIF results processed:")
-    print(f"       Kept (Failed):     {kept_failed:>5}")
-    print(f"       Dropped (Ignored): {dropped_ignored:>5}")
-    print(f"       Dropped (BT):      {dropped_below_threshold:>5}")
+    print(f"       Kept (failed_actionable):  {kept:>5}")
+    print(f"       Dropped (no_exploit):      {dropped_no_exploit:>5}")
+    print(f"       Dropped (no_fix):          {dropped_no_fix:>5}")
+    print(f"       Dropped (neither):         {dropped_neither:>5}")
+    print(f"       Dropped (ignored):         {dropped_ignored:>5}")
+    print(f"       Dropped (below_threshold): {dropped_below_threshold:>5}")
     if unmatched:
-        print(f"       Dropped (Unmatched):{unmatched:>5}  (typically EOL/secrets/non-CVE findings)")
-    print(f"     → GitHub Security tab will show: {kept_failed} Open alerts")
+        print(f"       Dropped (unmatched):       {unmatched:>5}  (EOL/secrets/non-CVE)")
+    print(f"     → GitHub Security tab will show: {kept} Open alerts")
 
     # Write to GitHub Step Summary
     summary_path = os.getenv("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a") as f:
             f.write("\n## Wiz Image Scan — GitHub Security Tab Mapping\n\n")
-            f.write(f"Filter applied based on Wiz policy `Zee-Container-Security`:\n\n")
-            f.write(f"| State | Count | Mapped From |\n")
+            f.write(f"Filter: `Failed by policy` AND `hasExploit` AND `hasFix`\n\n")
+            f.write(f"| State | Count | Description |\n")
             f.write(f"|-------|------:|--------|\n")
-            f.write(f"| 🔴 Open (action required) | **{kept_failed}** | Wiz `Failed` findings |\n")
-            f.write(f"| ⚪ Dropped from SARIF | {total_dropped} | Wiz `Ignored` / Below Threshold (visible in Wiz console) |\n")
-            f.write(f"\n**Total in GitHub Security tab:** {kept_failed} Open alerts\n")
+            f.write(f"| 🔴 Open (highest priority) | **{kept}** | Failed + Exploit + Fix |\n")
+            f.write(f"| ⚪ Dropped — no public exploit | {dropped_no_exploit} | Has fix, no known exploit |\n")
+            f.write(f"| ⚪ Dropped — no fix available | {dropped_no_fix} | Has exploit, no fix |\n")
+            f.write(f"| ⚪ Dropped — neither | {dropped_neither} | No exploit, no fix |\n")
+            f.write(f"| ⚪ Dropped — ignored/below threshold | {dropped_ignored + dropped_below_threshold} | Wiz policy excluded |\n")
+            f.write(f"\n**Total in GitHub Security tab:** {kept} Open alerts\n")
             f.write(f"**Total findings detected by Wiz:** {stats['total']}\n")
             if stats['total']:
-                reduction = (1 - kept_failed / stats['total']) * 100
+                reduction = (1 - kept / stats['total']) * 100
                 f.write(f"**Noise reduction:** {reduction:.1f}%\n")
+            f.write(f"\n_Findings dropped from SARIF remain visible in the Wiz console._\n")
 
     return sarif
 
