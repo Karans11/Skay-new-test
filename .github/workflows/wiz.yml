@@ -198,6 +198,21 @@ jobs:
           path: filter_dryrun.json
           retention-days: 7
 
+      - name: Diagnose proposed v2 filter (exploit + fix)
+        if: always() && hashFiles('image-layers.json') != ''
+        run: |
+          echo "::group::🔬 V2 Filter Diagnostic"
+          python .github/workflows/diagnose_v2_filter.py
+          echo "::endgroup::"
+
+      - name: Upload v2 diagnostic
+        if: always() && hashFiles('filter_v2_diagnostic.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: filter-v2-diagnostic
+          path: filter_v2_diagnostic.json
+          retention-days: 7
+          
       # === Beautification preview — show 3 sample alerts before deploying ===
       - name: Preview beautified alerts
         if: always() && hashFiles('image-layers.json') != ''
