@@ -50,14 +50,16 @@ jobs:
       # ─────────────────────────────────────────────────────────────
       - name: Wiz directory scan (SCA)
         run: |
-          wizcli dir scan --path . --format sarif --output-file dir.sarif || true
+          wizcli dir scan --path . -f sarif -o dir.sarif
+          ls -la dir.sarif
 
       # ─────────────────────────────────────────────────────────────
       # IaC Scan (Dockerfile misconfigurations)
       # ─────────────────────────────────────────────────────────────
       - name: Wiz IaC scan (Dockerfile)
         run: |
-          wizcli iac scan --path Dockerfile --format sarif --output-file dockerfile.sarif || true
+          wizcli iac scan --path Dockerfile -f sarif -o dockerfile.sarif
+          ls -la dockerfile.sarif
 
       # ─────────────────────────────────────────────────────────────
       # Build container image for scanning
@@ -77,8 +79,9 @@ jobs:
             --image wiz-vuln-demo:latest \
             --policy-hits-only \
             --policies "Zee-Container-Security" \
-            --format sarif \
-            --output-file image.sarif || true
+            -f sarif \
+            -o image.sarif
+          ls -la image.sarif
 
       - name: Wiz container image scan (per-layer JSON)
         run: |
@@ -86,12 +89,14 @@ jobs:
             --image wiz-vuln-demo:latest \
             --driver mountWithLayers \
             --policies "Zee-Container-Security" \
-            --format json \
-            --output-file image-layers.json || true
+            -f json \
+            -o image-layers.json
+          ls -la image-layers.json
 
       - name: Fix file ownership
         run: |
           sudo chown -R $(whoami):$(whoami) . || true
+          ls -la *.sarif *.json 2>/dev/null
 
       # ─────────────────────────────────────────────────────────────
       # Process SARIFs: V2 filter + beautification
