@@ -704,16 +704,23 @@ def filter_sarif_by_wiz_policy(sarif, attribution_map, stats):
             key = (cve, comp_name, comp_ver)
             attr = attribution_map.get(key)
 
-            if attr == "failed_actionable":
-                # KEEP: failed + has exploit + has fix (the actionable bucket)
+            # ┌─────────────────────────────────────────────────────────┐
+            # │ V2 FILTER DISABLED                                      │
+            # │ Wiz handles exploit/fix filtering via ignore rules.     │
+            # │ We keep ALL findings flagged by Wiz as "Failed".        │
+            # └─────────────────────────────────────────────────────────┘
+            if attr in ("failed_actionable", "failed_no_exploit",
+                        "failed_no_fix", "failed_neither"):
+                # KEEP: any finding Wiz classifies as Failed
                 new_results.append(result)
                 kept += 1
-            elif attr == "failed_no_exploit":
-                dropped_no_exploit += 1
-            elif attr == "failed_no_fix":
-                dropped_no_fix += 1
-            elif attr == "failed_neither":
-                dropped_neither += 1
+                # Track sub-bucket for visibility (still drops counted = 0)
+                if attr == "failed_no_exploit":
+                    pass  # was dropped_no_exploit, now kept
+                elif attr == "failed_no_fix":
+                    pass
+                elif attr == "failed_neither":
+                    pass
             elif attr == "ignored":
                 dropped_ignored += 1
             elif attr == "below_threshold":
