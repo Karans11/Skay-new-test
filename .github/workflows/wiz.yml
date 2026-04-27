@@ -4,114 +4,276 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
-  workflow_dispatch:
 
-permissions:
-  contents: read
-  security-events: write
-  actions: read
+env:
+  COLUMNS: "250"
+  TERM: xterm-256color
+  ACTIONS_RUNNER_DEBUG: true
+  ACTIONS_STEP_DEBUG: true
 
 jobs:
   wiz-scan:
-    name: Wiz Container Scan + Code Scanning Upload
     runs-on: ubuntu-latest
-
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+      pull-requests: write
     steps:
-      # ─────────────────────────────────────────────────────────────
-      # Setup
-      # ─────────────────────────────────────────────────────────────
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: '3.10'
 
-      - name: Install Python dependencies
+      - name: Install Dependencies
         run: pip install tabulate
 
-      - name: Download and install wizcli
+      - name: Download Wiz CLI
         run: |
-          curl -o wizcli https://wizcli.app.wiz.io/latest/wizcli
+          curl -o wizcli https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64
           chmod +x wizcli
-          sudo mv wizcli /usr/local/bin/
+          sudo mv wizcli /usr/local/bin/wizcli
+          wizcli version
 
-      - name: Authenticate wizcli
+      - name: Authenticate Wiz CLI
+        env:
+          WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+          WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+        run: wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
+
+      # === SCA: source dependency scan ===
+      - name: Wiz Directory Scan (SCA)
+        run: |
+          echo "::group::🔍 Wiz SCA Scan"
+          wizcli dir scan --path . \
+            --output dir.sarif,sarif,vulnerabilities \
+            --output dir.txt,human,vulnerabilities || true
+          echo "::endgroup::"
+
+          echo "::group::📋 SCA Findings Table"
+          cat dir.txt || echo "No text output produced"
+          echo "::endgroup::"
+        continue-on-error: true
+
+      # === IaC: Dockerfile misconfiguration scan ===
+      - name: Wiz Dockerfile Scan (IaC)
+        run: |
+          echo "::group::🔍 Wiz IaC Scan"
+          wizcli iac scan --path ./Dockerfile \
+            --output dockerfile.sarif,sarif,misconfigurations \
+            --output dockerfile.txt,human,misconfigurations || true
+          echo "::endgroup::"
+
+          echo "::group::📋 IaC Findings Table"
+          cat dockerfile.txt || echo "No text output produced"
+          echo "::endgroup::"
+        continue-on-error: true
+
+      # === Container image build ===
+      - name: Build Docker Image
+        run: |
+          echo "::group::🐳 Docker Build"
+          docker build -t wiz-vuln-demo:${{ github.sha }} .
+          echo "::endgroup::"
+        continue-on-error: true
+
+      # === Container image scan for SARIF (default driver — reliable upload) ===
+      # Now also includes --policies flag to apply customer's CI/CD policy
+      - name: Wiz Container Image Scan (SARIF)
+        if: success()
+        run: |
+          echo "::group::🔍 Wiz Container Image Scan (for SARIF upload)"
+          wizcli docker scan \
+            --image wiz-vuln-demo:${{ github.sha }} \
+            --policies "Zee-Container-Security" \
+            --output image.sarif,sarif,vulnerabilities \
+            --output image.txt,human,vulnerabilities || true
+          echo "::endgroup::"
+
+          echo "::group::📋 Image Findings Table"
+          cat image.txt || echo "No text output produced"
+          echo "::endgroup::"
+        continue-on-error: true
+
+      # === Container image scan for per-layer JSON (mountWithLayers needs root) ===
+      # WITH --policies flag for the customer's policy (Zee-Container-Security)
+      - name: Wiz Container Image Scan (per-layer JSON)
+        if: success()
         env:
           WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
           WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
         run: |
-          wizcli auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
+          echo "::group::🔑 Re-auth wizcli as root (needed for overlay2 driver)"
+          sudo -E $(which wizcli) auth --id "$WIZ_CLIENT_ID" --secret "$WIZ_CLIENT_SECRET"
+          echo "::endgroup::"
 
-      # ─────────────────────────────────────────────────────────────
-      # Source Code SCA Scan (secrets, dependencies)
-      # ─────────────────────────────────────────────────────────────
-      - name: Wiz directory scan (SCA)
-        run: |
-          wizcli dir scan --path . -f sarif -o dir.sarif
-          ls -la dir.sarif
-
-      # ─────────────────────────────────────────────────────────────
-      # IaC Scan (Dockerfile misconfigurations)
-      # ─────────────────────────────────────────────────────────────
-      - name: Wiz IaC scan (Dockerfile)
-        run: |
-          wizcli iac scan --path Dockerfile -f sarif -o dockerfile.sarif
-          ls -la dockerfile.sarif
-
-      # ─────────────────────────────────────────────────────────────
-      # Build container image for scanning
-      # ─────────────────────────────────────────────────────────────
-      - name: Build Docker image
-        run: |
-          docker build -t wiz-vuln-demo:latest .
-
-      # ─────────────────────────────────────────────────────────────
-      # Container Image Scan — Two outputs:
-      #   1. SARIF for GitHub upload
-      #   2. JSON with layer info for policy filter + beautification
-      # ─────────────────────────────────────────────────────────────
-      - name: Wiz container image scan (SARIF)
-        run: |
-          wizcli docker scan \
-            --image wiz-vuln-demo:latest \
-            --policy-hits-only \
-            --policies "Zee-Container-Security" \
-            -f sarif \
-            -o image.sarif
-          ls -la image.sarif
-
-      - name: Wiz container image scan (per-layer JSON)
-        run: |
-          wizcli docker scan \
-            --image wiz-vuln-demo:latest \
+          echo "::group::🔍 Wiz Container Image Scan - Per Layer (JSON only) WITH POLICY"
+          sudo -E $(which wizcli) docker scan \
+            --image wiz-vuln-demo:${{ github.sha }} \
             --driver mountWithLayers \
             --policies "Zee-Container-Security" \
-            -f json \
-            -o image-layers.json
-          ls -la image-layers.json
+            --output image-layers.json,json,vulnerabilities \
+            --output image-layers-policy.txt,human,vulnerabilities || true
+          echo "::endgroup::"
 
+          echo "::group::📋 Policy-applied scan output (human format, first 100 lines)"
+          cat image-layers-policy.txt 2>/dev/null | head -100 || echo "no human output"
+          echo "::endgroup::"
+        continue-on-error: true
+
+      # === Fix ownership on all output files so Python can overwrite them ===
       - name: Fix file ownership
+        if: always()
         run: |
-          sudo chown -R $(whoami):$(whoami) . || true
-          ls -la *.sarif *.json 2>/dev/null
+          echo "::group::📂 File ownership check"
+          echo "Before fix:"
+          ls -la *.sarif *.txt *.json 2>/dev/null || true
+          echo ""
+          echo "Taking ownership of all scan outputs..."
+          sudo chown -R $USER:$USER . 2>/dev/null || true
+          sudo chmod 666 *.sarif *.txt *.json 2>/dev/null || true
+          echo ""
+          echo "After fix:"
+          ls -la *.sarif *.txt *.json 2>/dev/null || true
+          echo "::endgroup::"
 
-      # ─────────────────────────────────────────────────────────────
-      # Process SARIFs: V2 filter + beautification
-      #   Applies filter: Failed + hasExploit + hasFix
-      #   Adds rich titles, tags, helpUri to image.sarif
-      # ─────────────────────────────────────────────────────────────
-      - name: Enrich and apply V2 filter
+      # === Diagnostic: inspect wizcli JSON structure ===
+      - name: Inspect wizcli output structure
+        if: always()
         run: |
-          echo "::group::📊 Wiz Scan Summary"
+          echo "::group::📄 image-layers.json structure"
+          python3 -c "
+          import json
+          with open('image-layers.json') as f:
+              data = json.load(f)
+          result = data.get('result', {})
+          print('result keys:', list(result.keys()))
+          for key in ['osPackages', 'libraries', 'applications', 'secrets']:
+              items = result.get(key, [])
+              if items:
+                  print(f'{key}: {len(items)} items')
+                  sample = items[0]
+                  print(f'  sample keys: {list(sample.keys())}')
+                  vulns = sample.get('vulnerabilities', [])
+                  if vulns:
+                      print(f'  vuln sample keys: {list(vulns[0].keys())}')
+          " 2>/dev/null || echo "python inspect failed"
+          echo "::endgroup::"
+
+      # === NEW: Findings analyzer (Wiz vs Prisma comparison) ===
+      - name: Analyze findings (Wiz vs Prisma)
+        if: always() && hashFiles('image-layers.json') != ''
+        run: |
+          echo "::group::📊 Findings Breakdown Analysis"
+          python .github/workflows/analyze_findings.py
+          echo "::endgroup::"
+
+      # === NEW: Upload analysis artifact for download ===
+      - name: Upload analysis artifact
+        if: always() && hashFiles('findings_analysis.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: findings-analysis
+          path: |
+            findings_analysis.json
+            image-layers.json
+            image-layers-policy.txt
+          retention-days: 7
+      # === DRY RUN: Validate filter logic before deploying ===
+      - name: Dry-run policy filter validation
+        if: always() && hashFiles('image-layers.json') != '' && hashFiles('image.sarif') != ''
+        run: |
+          echo "::group::🧪 Dry-Run Filter Validation"
+          python .github/workflows/dryrun_filter.py
+          echo "::endgroup::"
+
+      - name: Upload dry-run diagnostic
+        if: always() && hashFiles('filter_dryrun.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: filter-dryrun
+          path: filter_dryrun.json
+          retention-days: 7
+
+      - name: Diagnose proposed v2 filter (exploit + fix)
+        if: always() && hashFiles('image-layers.json') != ''
+        run: |
+          echo "::group::🔬 V2 Filter Diagnostic"
+          python .github/workflows/diagnose_v2_filter.py
+          echo "::endgroup::"
+
+      - name: Upload v2 diagnostic
+        if: always() && hashFiles('filter_v2_diagnostic.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: filter-v2-diagnostic
+          path: filter_v2_diagnostic.json
+          retention-days: 7
+          
+      # === Beautification preview — show 3 sample alerts before deploying ===
+      - name: Preview beautified alerts
+        if: always() && hashFiles('image-layers.json') != ''
+        run: |
+          echo "::group::🎨 Beautification Preview"
+          python .github/workflows/preview_alerts.py
+          echo "::endgroup::"
+
+      - name: Upload beautification preview artifact
+        if: always() && hashFiles('preview_sample_alerts.md') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: beautification-preview
+          path: preview_sample_alerts.md
+          retention-days: 7
+      # === Enrich SARIF + print clean summary table + per-layer report ===
+      - name: Enrich and Display Summary
+        if: always()
+        run: |
+          echo "::group::📊 Enriched Summary Report"
           python .github/workflows/wizsarif.py
           echo "::endgroup::"
 
-      # ─────────────────────────────────────────────────────────────
-      # Upload to GitHub Code Scanning
-      # ─────────────────────────────────────────────────────────────
+      # === Pre-upload diagnostics ===
+      - name: Diagnose image SARIF before upload
+        if: always() && hashFiles('image.sarif') != ''
+        run: |
+          echo "::group::📏 Image SARIF pre-upload diagnostics"
+          echo "File size: $(du -h image.sarif | cut -f1)"
+          echo "File size in bytes: $(wc -c < image.sarif)"
+          python3 -c "
+          import json
+          with open('image.sarif') as f:
+              s = json.load(f)
+          total_results = sum(len(r.get('results', [])) for r in s.get('runs', []))
+          total_rules = sum(len(r.get('tool', {}).get('driver', {}).get('rules', [])) for r in s.get('runs', []))
+          versions = [r.get('tool', {}).get('driver', {}).get('version', 'unknown') for r in s.get('runs', [])]
+          print(f'Total results: {total_results}')
+          print(f'Total rules: {total_rules}')
+          print(f'Tool versions: {versions}')
+          print(f'Schema: {s.get(\"\$schema\", \"none\")}')
+          print(f'Version: {s.get(\"version\", \"none\")}')
+          "
+          echo "::endgroup::"
+
+      - name: Deep SARIF diagnostic
+        if: always() && hashFiles('image.sarif') != ''
+        run: |
+          echo "::group::🔬 Deep SARIF diagnostic"
+          python .github/workflows/diagnose_sarif.py image.sarif
+          echo "::endgroup::"
+
+      - name: Upload diagnostic sample artifact
+        if: always() && hashFiles('sarif_sample_results.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-sample-results
+          path: sarif_sample_results.json
+          retention-days: 7
+
+      # === Upload enriched SARIFs to GitHub Security tab ===
       - name: Upload SCA SARIF
         if: always() && hashFiles('dir.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
